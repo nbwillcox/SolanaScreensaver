@@ -1,0 +1,764 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Solana Screensaver</title>
+<style>
+  * { margin: 0; padding: 0; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #020208; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #hint {
+    position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%);
+    color: rgba(100, 200, 255, 0.7); font: 14px/1 system-ui, sans-serif;
+    letter-spacing: 2px; text-transform: uppercase;
+    transition: opacity 2s; pointer-events: none; z-index: 10;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">Press ESC to exit</div>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W, H, S;
+let circuitBg = null;
+
+function resize() {
+  W = window.innerWidth;
+  H = window.innerHeight;
+  S = Math.min(W, H) / 900;
+  canvas.width = W;
+  canvas.height = H;
+  circuitBg = null;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// Cursor auto-hide
+let cursorTimer;
+function resetCursor() {
+  document.body.style.cursor = 'default';
+  clearTimeout(cursorTimer);
+  cursorTimer = setTimeout(() => { document.body.style.cursor = 'none'; }, 3000);
+}
+document.addEventListener('mousemove', resetCursor);
+setTimeout(() => { document.body.style.cursor = 'none'; }, 3000);
+
+// Fade hint
+setTimeout(() => { document.getElementById('hint').style.opacity = '0'; }, 4000);
+
+// ESC to exit all windows
+const exitChannel = new BroadcastChannel('solana-screensaver-exit');
+exitChannel.onmessage = () => { try { window.close(); } catch(e) {} };
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    exitChannel.postMessage('exit');
+    if (document.fullscreenElement) document.exitFullscreen();
+    try { window.close(); } catch(e) {}
+  }
+});
+
+// --- Colors (gradient pairs matching the PNG: left color → right color) ---
+const COLORS = [
+  { l: { r: 0, g: 230, b: 210 }, r: { r: 30, g: 255, b: 120 } },   // top: cyan/teal → green
+  { l: { r: 20, g: 120, b: 255 }, r: { r: 0, g: 220, b: 180 } },   // mid: deep blue → teal/green
+  { l: { r: 180, g: 50, b: 240 }, r: { r: 50, g: 150, b: 255 } },   // bot: magenta/purple → blue/cyan
+];
+const PAL = [
+  { r: 0, g: 255, b: 120 },
+  { r: 0, g: 240, b: 200 },
+  { r: 0, g: 200, b: 255 },
+  { r: 50, g: 140, b: 255 },
+  { r: 130, g: 80, b: 255 },
+  { r: 200, g: 60, b: 240 },
+];
+function rgba(c, a) { return `rgba(${c.r|0},${c.g|0},${c.b|0},${a})`; }
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+function seededRng(s) {
+  return () => { s |= 0; s = s + 0x6D2B79F5 | 0; let t = Math.imul(s ^ s >>> 15, 1 | s); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+}
+
+// --- Circuit board background ---
+function calcPathLength(path) {
+  let len = 0;
+  for (let i = 1; i < path.length; i++) len += Math.hypot(path[i][0] - path[i-1][0], path[i][1] - path[i-1][1]);
+  return len;
+}
+
+function getPointOnPath(path, totalLen, t) {
+  const target = t * totalLen;
+  let traveled = 0;
+  for (let i = 1; i < path.length; i++) {
+    const segLen = Math.hypot(path[i][0] - path[i-1][0], path[i][1] - path[i-1][1]);
+    if (segLen < 0.001) continue;
+    if (traveled + segLen >= target) {
+      const frac = (target - traveled) / segLen;
+      return [lerp(path[i-1][0], path[i][0], frac), lerp(path[i-1][1], path[i][1], frac)];
+    }
+    traveled += segLen;
+  }
+  return [path[path.length - 1][0], path[path.length - 1][1]];
+}
+
+function generateCircuitBg() {
+  const rng = seededRng(54321);
+  const nodes = [];
+  const traces = [];
+
+  // Sparse junction nodes across the screen
+  const spacing = 160 * S;
+  const cols = Math.ceil(W / spacing) + 1;
+  const rows = Math.ceil(H / spacing) + 1;
+
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      if (rng() > 0.45) continue;
+      nodes.push({
+        x: c * spacing + (rng() - 0.5) * spacing * 0.7,
+        y: r * spacing + (rng() - 0.5) * spacing * 0.7,
+        size: (1.5 + rng() * 2.5) * S,
+        ci: (rng() * PAL.length) | 0
+      });
+    }
+  }
+
+  // Connect nearby nodes with L/Z-shaped PCB routes
+  for (let i = 0; i < nodes.length; i++) {
+    const maxConn = 1 + (rng() > 0.6 ? 1 : 0);
+    let conn = 0;
+    for (let j = i + 1; j < nodes.length && conn < maxConn; j++) {
+      const d = Math.hypot(nodes[j].x - nodes[i].x, nodes[j].y - nodes[i].y);
+      if (d > spacing * 3.5 || rng() > 0.4) continue;
+      const a = nodes[i], b = nodes[j];
+      let path;
+      const style = rng();
+      if (style < 0.4) {
+        path = [[a.x, a.y], [b.x, a.y], [b.x, b.y]];
+      } else if (style < 0.8) {
+        path = [[a.x, a.y], [a.x, b.y], [b.x, b.y]];
+      } else {
+        const my = (a.y + b.y) / 2 + (rng() - 0.5) * 60;
+        path = [[a.x, a.y], [a.x, my], [b.x, my], [b.x, b.y]];
+      }
+      const len = calcPathLength(path);
+      if (len > 10) { traces.push({ path, length: len, ci: (rng() * PAL.length) | 0 }); conn++; }
+    }
+  }
+
+  // Long horizontal bus traces
+  for (let i = 0; i < 3 + (rng() * 3 | 0); i++) {
+    const y = rng() * H;
+    const x1 = rng() * W * 0.15, x2 = W * 0.85 + rng() * W * 0.15;
+    traces.push({ path: [[x1, y], [x2, y]], length: x2 - x1, ci: (rng() * PAL.length) | 0 });
+  }
+
+  // Long vertical traces
+  for (let i = 0; i < 2 + (rng() * 2 | 0); i++) {
+    const x = rng() * W;
+    const y1 = rng() * H * 0.15, y2 = H * 0.85 + rng() * H * 0.15;
+    traces.push({ path: [[x, y1], [x, y2]], length: y2 - y1, ci: (rng() * PAL.length) | 0 });
+  }
+
+  return { nodes, traces };
+}
+
+// --- Background ---
+function drawBg(time) {
+  const g = ctx.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, Math.max(W, H) * 0.8);
+  g.addColorStop(0, '#0a0f1e');
+  g.addColorStop(1, '#020208');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+
+  // Circuit board traces
+  if (!circuitBg) circuitBg = generateCircuitBg();
+
+  ctx.lineCap = 'square';
+  ctx.lineJoin = 'miter';
+  for (const trace of circuitBg.traces) {
+    const c = PAL[trace.ci];
+    ctx.beginPath();
+    ctx.moveTo(trace.path[0][0], trace.path[0][1]);
+    for (let i = 1; i < trace.path.length; i++) ctx.lineTo(trace.path[i][0], trace.path[i][1]);
+    ctx.strokeStyle = rgba(c, 0.04 + Math.sin(time * 0.3 + trace.ci) * 0.008);
+    ctx.lineWidth = 0.8 * S;
+    ctx.stroke();
+  }
+
+  // Junction nodes (small pads)
+  for (const node of circuitBg.nodes) {
+    const c = PAL[node.ci];
+    ctx.beginPath();
+    ctx.arc(node.x, node.y, node.size, 0, Math.PI * 2);
+    ctx.fillStyle = rgba(c, 0.04);
+    ctx.strokeStyle = rgba(c, 0.07);
+    ctx.lineWidth = 0.5 * S;
+    ctx.fill();
+    ctx.stroke();
+  }
+}
+
+// --- Solana piece shape (matching the PNG proportions) ---
+// dir=1: skews right (top/bottom pieces), dir=-1: skews left (middle piece)
+function piecePath(cx, cy, w, h, dir) {
+  const sk = w * 0.10;
+  const r = h * 0.28;
+
+  const pts = dir === 1 ? [
+    [cx - w / 2 + sk, cy - h / 2],   // top-left (indented right)
+    [cx + w / 2 + sk, cy - h / 2],   // top-right
+    [cx + w / 2 - sk, cy + h / 2],   // bottom-right (indented left)
+    [cx - w / 2 - sk, cy + h / 2],   // bottom-left
+  ] : [
+    [cx - w / 2 - sk, cy - h / 2],   // top-left
+    [cx + w / 2 - sk, cy - h / 2],   // top-right (indented left)
+    [cx + w / 2 + sk, cy + h / 2],   // bottom-right
+    [cx - w / 2 + sk, cy + h / 2],   // bottom-left (indented right)
+  ];
+
+  ctx.beginPath();
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[(i - 1 + pts.length) % pts.length], c = pts[i], n = pts[(i + 1) % pts.length];
+    const d1x = c[0] - p[0], d1y = c[1] - p[1], d2x = n[0] - c[0], d2y = n[1] - c[1];
+    const l1 = Math.hypot(d1x, d1y), l2 = Math.hypot(d2x, d2y);
+    if (l1 < 0.01 || l2 < 0.01) { if (i === 0) ctx.moveTo(c[0], c[1]); else ctx.lineTo(c[0], c[1]); continue; }
+    const rr = Math.min(r, l1 / 3, l2 / 3);
+    const x1 = c[0] - (d1x / l1) * rr, y1 = c[1] - (d1y / l1) * rr;
+    const x2 = c[0] + (d2x / l2) * rr, y2 = c[1] + (d2y / l2) * rr;
+    if (i === 0) ctx.moveTo(x1, y1); else ctx.lineTo(x1, y1);
+    ctx.quadraticCurveTo(c[0], c[1], x2, y2);
+  }
+  ctx.closePath();
+}
+
+// --- Circuit traces (clean, structured — matching PNG) ---
+function drawTraces(cx, cy, w, h, color, time, seed) {
+  ctx.save();
+  const rng = seededRng(seed);
+  const pad = w * 0.16;
+  const l = cx - w / 2 + pad, r = cx + w / 2 - pad * 0.7;
+  const t = cy - h / 2 + h * 0.22, b = cy + h / 2 - h * 0.22;
+  const iw = r - l, ih = b - t;
+  if (iw < 10 || ih < 2) { ctx.restore(); return; }
+
+  // Main horizontal traces (solid lines with subtle glow)
+  ctx.strokeStyle = rgba(color, 0.45);
+  ctx.lineWidth = 1.8 * S;
+  ctx.shadowColor = rgba(color, 0.6);
+  ctx.shadowBlur = 6 * S;
+
+  const n = 2 + (rng() * 2 | 0);
+  const traces = [];
+  for (let i = 0; i < n; i++) {
+    const yy = t + ih * (i + 1) / (n + 1);
+    const x1 = l + rng() * iw * 0.05;
+    const x2 = r - rng() * iw * 0.05;
+    const mx1 = x1 + (x2 - x1) * (0.2 + rng() * 0.2);
+    const mx2 = x1 + (x2 - x1) * (0.5 + rng() * 0.3);
+    const jog1 = (rng() - 0.5) * ih * 0.35;
+    const jog2 = (rng() - 0.5) * ih * 0.2;
+
+    ctx.beginPath();
+    ctx.moveTo(x1, yy);
+    ctx.lineTo(mx1, yy);
+    ctx.lineTo(mx1, yy + jog1);
+    ctx.lineTo(mx2, yy + jog1);
+    ctx.lineTo(mx2, yy + jog1 + jog2);
+    ctx.lineTo(x2, yy + jog1 + jog2);
+    ctx.stroke();
+
+    traces.push(
+      [x1, yy], [mx1, yy], [mx1, yy + jog1],
+      [mx2, yy + jog1], [mx2, yy + jog1 + jog2], [x2, yy + jog1 + jog2]
+    );
+  }
+
+  // Vertical connectors
+  ctx.strokeStyle = rgba(color, 0.3);
+  for (let i = 0; i < 1 + (rng() * 2 | 0); i++) {
+    const xx = l + iw * (0.2 + rng() * 0.6);
+    ctx.beginPath(); ctx.moveTo(xx, t); ctx.lineTo(xx, b); ctx.stroke();
+  }
+
+  ctx.shadowBlur = 0;
+
+  // IC chips (small filled rectangles)
+  ctx.fillStyle = rgba(color, 0.08);
+  ctx.strokeStyle = rgba(color, 0.3);
+  ctx.lineWidth = 0.8 * S;
+  for (let i = 0; i < 2 + (rng() * 2 | 0); i++) {
+    const cw = (6 + rng() * 12) * S, ch = (3 + rng() * 6) * S;
+    const px = l + rng() * (iw - cw), py = t + rng() * (ih - ch);
+    ctx.fillRect(px, py, cw, ch);
+    ctx.strokeRect(px, py, cw, ch);
+    // Pin marks
+    const pins = 2 + (rng() * 3 | 0);
+    for (let j = 0; j < pins; j++) {
+      const px2 = px + cw * (j + 1) / (pins + 1);
+      ctx.fillStyle = rgba(color, 0.25);
+      ctx.fillRect(px2 - 1 * S, py - 2 * S, 2 * S, 2 * S);
+      ctx.fillRect(px2 - 1 * S, py + ch, 2 * S, 2 * S);
+    }
+    ctx.fillStyle = rgba(color, 0.08);
+  }
+
+  // Bright glowing junction nodes (like in the PNG — the prominent dots)
+  const nodePositions = [];
+  for (let i = 0; i < 6 + (rng() * 5 | 0); i++) {
+    nodePositions.push([l + rng() * iw, t + rng() * ih]);
+  }
+  // Also add nodes at trace junctions
+  for (let i = 0; i < traces.length; i += 3) {
+    if (traces[i]) nodePositions.push(traces[i]);
+  }
+
+  for (let i = 0; i < nodePositions.length; i++) {
+    const [nx, ny] = nodePositions[i];
+    const pulse = Math.sin(time * 2.5 + i * 1.9 + seed) * 0.5 + 0.5;
+    const bright = 0.5 + pulse * 0.5;
+
+    // Outer glow
+    ctx.beginPath(); ctx.arc(nx, ny, (4.5 + pulse * 3) * S, 0, Math.PI * 2);
+    ctx.fillStyle = rgba(color, bright * 0.3);
+    ctx.shadowColor = rgba(color, bright);
+    ctx.shadowBlur = (10 + pulse * 15) * S;
+    ctx.fill();
+
+    // Bright center
+    ctx.beginPath(); ctx.arc(nx, ny, (2 + pulse * 1.2) * S, 0, Math.PI * 2);
+    ctx.fillStyle = rgba({ r: Math.min(255, color.r + 100), g: Math.min(255, color.g + 100), b: Math.min(255, color.b + 100) }, bright);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+
+  ctx.restore();
+}
+
+// --- Draw one piece as thick beveled glass slab ---
+// col = { l: {r,g,b}, r: {r,g,b} } — left and right gradient colors
+function drawPiece(cx, cy, w, h, dir, col, time, seed) {
+  ctx.save();
+  const cL = col.l, cR = col.r;
+  const cMid = { r: (cL.r + cR.r) / 2, g: (cL.g + cR.g) / 2, b: (cL.b + cR.b) / 2 };
+  const cBright = { r: Math.min(255, cMid.r + 120), g: Math.min(255, cMid.g + 120), b: Math.min(255, cMid.b + 120) };
+
+  function hGrad(a) {
+    const g = ctx.createLinearGradient(cx - w / 2, cy, cx + w / 2, cy);
+    g.addColorStop(0, rgba(cL, a));
+    g.addColorStop(1, rgba(cR, a));
+    return g;
+  }
+
+  // 1. Far atmospheric bloom (large soft outer glow)
+  piecePath(cx, cy, w + 28 * S, h + 28 * S, dir);
+  ctx.shadowColor = rgba(cMid, 0.5);
+  ctx.shadowBlur = 70 * S;
+  ctx.fillStyle = rgba(cMid, 0.025);
+  ctx.fill();
+  ctx.fill();
+  ctx.shadowBlur = 0;
+
+  // 2. Near bloom halo
+  piecePath(cx, cy, w + 10 * S, h + 10 * S, dir);
+  ctx.shadowColor = rgba(cMid, 0.55);
+  ctx.shadowBlur = 35 * S;
+  ctx.strokeStyle = hGrad(0.18);
+  ctx.lineWidth = 5 * S;
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  // 3. Main glass body fill (solid translucent slab)
+  piecePath(cx, cy, w, h, dir);
+  ctx.fillStyle = hGrad(0.28);
+  ctx.fill();
+
+  // 4. Inner body layer (slightly inset, adds depth)
+  piecePath(cx, cy, w - 5 * S, h - 5 * S, dir);
+  ctx.fillStyle = hGrad(0.1);
+  ctx.fill();
+
+  // 5. Vertical bevel gradient (bright top, dark center, subtle bottom)
+  piecePath(cx, cy, w, h, dir);
+  const bevel = ctx.createLinearGradient(cx, cy - h / 2, cx, cy + h / 2);
+  bevel.addColorStop(0, 'rgba(255,255,255,0.18)');
+  bevel.addColorStop(0.12, 'rgba(255,255,255,0.07)');
+  bevel.addColorStop(0.45, 'rgba(0,0,0,0.07)');
+  bevel.addColorStop(0.82, 'rgba(0,0,0,0.02)');
+  bevel.addColorStop(1, 'rgba(255,255,255,0.07)');
+  ctx.fillStyle = bevel;
+  ctx.fill();
+
+  // 6. Clipped interior details
+  ctx.save();
+  piecePath(cx, cy, w, h, dir);
+  ctx.clip();
+
+  // 6a. Chrome highlight strip at top edge
+  const chrome = ctx.createLinearGradient(cx, cy - h / 2, cx, cy - h * 0.05);
+  chrome.addColorStop(0, 'rgba(255,255,255,0.24)');
+  chrome.addColorStop(0.3, 'rgba(255,255,255,0.09)');
+  chrome.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = chrome;
+  ctx.fillRect(cx - w, cy - h, w * 2, h);
+
+  // 6b. Bottom edge reflection
+  const botRef = ctx.createLinearGradient(cx, cy + h * 0.3, cx, cy + h / 2);
+  botRef.addColorStop(0, 'rgba(255,255,255,0)');
+  botRef.addColorStop(0.75, 'rgba(255,255,255,0.04)');
+  botRef.addColorStop(1, 'rgba(255,255,255,0.09)');
+  ctx.fillStyle = botRef;
+  ctx.fillRect(cx - w, cy, w * 2, h);
+
+  // 6c. Glass sheen (off-center radial highlight)
+  const sheen = ctx.createRadialGradient(cx + w * 0.12, cy - h * 0.12, 0, cx, cy, w * 0.45);
+  sheen.addColorStop(0, 'rgba(255,255,255,0.055)');
+  sheen.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = sheen;
+  ctx.fillRect(cx - w, cy - h, w * 2, h * 2);
+
+  // 6d. Circuit traces (clipped inside)
+  drawTraces(cx, cy, w, h, cMid, time, seed);
+  ctx.restore();
+
+  // 7. Outer neon edge (bright border with glow)
+  piecePath(cx, cy, w, h, dir);
+  ctx.shadowColor = rgba(cMid, 0.85);
+  ctx.shadowBlur = 16 * S;
+  ctx.strokeStyle = hGrad(0.82);
+  ctx.lineWidth = 2.2 * S;
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  // 8. Inner rim border (beveled inset)
+  piecePath(cx, cy, w - 7 * S, h - 7 * S, dir);
+  ctx.strokeStyle = hGrad(0.16);
+  ctx.lineWidth = 0.9 * S;
+  ctx.stroke();
+
+  // 9. Corner specular flares
+  const sk = w * 0.10;
+  const pts = dir === 1 ? [
+    [cx - w / 2 + sk, cy - h / 2],
+    [cx + w / 2 + sk, cy - h / 2],
+    [cx + w / 2 - sk, cy + h / 2],
+    [cx - w / 2 - sk, cy + h / 2],
+  ] : [
+    [cx - w / 2 - sk, cy - h / 2],
+    [cx + w / 2 - sk, cy - h / 2],
+    [cx + w / 2 + sk, cy + h / 2],
+    [cx - w / 2 + sk, cy + h / 2],
+  ];
+
+  for (let i = 0; i < pts.length; i++) {
+    const [fx, fy] = pts[i];
+    const pulse = Math.sin(time * 1.5 + i * 1.7 + seed * 0.001) * 0.3 + 0.7;
+    const isTop = (i < 2);
+    const flareA = (isTop ? 0.55 : 0.3) * pulse;
+
+    ctx.beginPath();
+    ctx.arc(fx, fy, 4 * S, 0, Math.PI * 2);
+    ctx.fillStyle = rgba(cBright, flareA);
+    ctx.shadowColor = rgba(cMid, flareA * 0.9);
+    ctx.shadowBlur = 14 * S;
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.arc(fx, fy, 1.5 * S, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(255,255,255,${flareA * 0.8})`;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+
+  // 10. Edge specular dots along top edge
+  for (let i = 0; i < 3; i++) {
+    const t = (i + 1) / 4;
+    const ex = lerp(pts[0][0], pts[1][0], t);
+    const ey = lerp(pts[0][1], pts[1][1], t);
+    const ep = Math.sin(time * 2.2 + i * 2.5 + seed * 0.002) * 0.25 + 0.4;
+    ctx.beginPath();
+    ctx.arc(ex, ey, 2.2 * S, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(255,255,255,${ep * 0.35})`;
+    ctx.shadowColor = rgba(cBright, ep * 0.4);
+    ctx.shadowBlur = 8 * S;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+
+  ctx.restore();
+}
+
+// --- Draw the complete Solana S logo ---
+function drawSolanaLogo(cx, cy, scale, rotation, time) {
+  const w = 340 * scale * S;
+  const h = 100 * scale * S;
+  const gap = 8 * scale * S;
+  const offset = 25 * scale * S;
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(rotation);
+
+  // Top piece — shifted right, skews right
+  drawPiece(offset, -(h + gap), w, h, 1, COLORS[0], time, 11111);
+  // Middle piece — shifted left, skews LEFT (opposite)
+  drawPiece(-offset, 0, w, h, -1, COLORS[1], time, 22222);
+  // Bottom piece — shifted right, skews right
+  drawPiece(offset, h + gap, w, h, 1, COLORS[2], time, 33333);
+
+  ctx.restore();
+}
+
+// --- Particles ---
+class Particle {
+  constructor() { this.reset(true); }
+  reset(scatter) {
+    this.x = scatter ? Math.random() * W : (Math.random() < 0.5 ? W + 20 : -20);
+    this.y = Math.random() * H;
+    this.sz = (0.8 + Math.random() * 2) * S;
+    this.vx = (Math.random() - 0.5) * 20;
+    this.vy = (Math.random() - 0.5) * 12;
+    this.alpha = 0.15 + Math.random() * 0.5;
+    this.ci = Math.random() * PAL.length | 0;
+    this.ph = Math.random() * Math.PI * 2;
+    this.ps = 1.5 + Math.random() * 3;
+    this.life = 8 + Math.random() * 18;
+    this.age = scatter ? Math.random() * this.life : 0;
+  }
+  update(dt) {
+    this.x += this.vx * dt; this.y += this.vy * dt;
+    this.ph += this.ps * dt; this.age += dt;
+    if (this.age > this.life || this.x < -30 || this.x > W + 30 || this.y < -30 || this.y > H + 30) this.reset(false);
+  }
+  draw() {
+    const p = Math.sin(this.ph) * 0.5 + 0.5;
+    const c = PAL[this.ci];
+    const fi = Math.min(1, this.age * 1.5);
+    const fo = Math.max(0, 1 - Math.max(0, this.age - this.life + 2) / 2);
+    const a = this.alpha * (0.4 + p * 0.6) * fi * fo;
+    if (a < 0.01) return;
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, this.sz + p * 1.5 * S, 0, Math.PI * 2);
+    ctx.fillStyle = rgba(c, a);
+    ctx.shadowColor = rgba(c, Math.min(1, a * 1.3));
+    ctx.shadowBlur = (6 + p * 10) * S;
+    ctx.fill(); ctx.shadowBlur = 0;
+  }
+}
+
+// --- Energy beams ---
+class Beam {
+  constructor() { this.active = false; this.cd = 1 + Math.random() * 5; }
+  update(dt) {
+    if (!this.active) {
+      this.cd -= dt;
+      if (this.cd <= 0) {
+        this.active = true;
+        this.y = Math.random() * H;
+        this.x = -200;
+        this.spd = 400 + Math.random() * 700;
+        this.len = (100 + Math.random() * 300) * S;
+        this.h = (1.5 + Math.random() * 4) * S;
+        this.a = 0.04 + Math.random() * 0.08;
+        this.ci = Math.random() * PAL.length | 0;
+      }
+      return;
+    }
+    this.x += this.spd * dt;
+    if (this.x > W + 300) { this.active = false; this.cd = 3 + Math.random() * 10; }
+  }
+  draw() {
+    if (!this.active) return;
+    const c = PAL[this.ci];
+    const g = ctx.createLinearGradient(this.x, 0, this.x + this.len, 0);
+    g.addColorStop(0, rgba(c, 0));
+    g.addColorStop(0.3, rgba(c, this.a));
+    g.addColorStop(0.7, rgba(c, this.a));
+    g.addColorStop(1, rgba(c, 0));
+    ctx.fillStyle = g;
+    ctx.fillRect(this.x, this.y - this.h, this.len, this.h * 2);
+  }
+}
+
+// --- Ambient glow orbs ---
+class Orb {
+  constructor() {
+    this.x = Math.random() * W; this.y = Math.random() * H;
+    this.r = (80 + Math.random() * 200) * S;
+    this.vx = (Math.random() - 0.5) * 8; this.vy = (Math.random() - 0.5) * 5;
+    this.ci = Math.random() * PAL.length | 0;
+    this.ph = Math.random() * Math.PI * 2;
+  }
+  update(dt) {
+    this.x += this.vx * dt; this.y += this.vy * dt; this.ph += 0.3 * dt;
+    if (this.x < -this.r) this.x = W + this.r;
+    if (this.x > W + this.r) this.x = -this.r;
+    if (this.y < -this.r) this.y = H + this.r;
+    if (this.y > H + this.r) this.y = -this.r;
+  }
+  draw() {
+    const c = PAL[this.ci];
+    const p = Math.sin(this.ph) * 0.5 + 0.5;
+    const a = 0.02 + p * 0.02;
+    const g = ctx.createRadialGradient(this.x, this.y, 0, this.x, this.y, this.r);
+    g.addColorStop(0, rgba(c, a));
+    g.addColorStop(1, rgba(c, 0));
+    ctx.fillStyle = g;
+    ctx.fillRect(this.x - this.r, this.y - this.r, this.r * 2, this.r * 2);
+  }
+}
+
+// --- Data pulses traveling along circuit traces ---
+class TracePulse {
+  constructor() { this.active = false; this.cooldown = Math.random() * 3; }
+  reset() {
+    if (!circuitBg || circuitBg.traces.length === 0) { this.active = false; return; }
+    this.active = true;
+    this.traceIdx = (Math.random() * circuitBg.traces.length) | 0;
+    this.progress = 0;
+    this.speed = 0.12 + Math.random() * 0.28;
+    this.ci = circuitBg.traces[this.traceIdx].ci;
+    this.tailLen = 0.06 + Math.random() * 0.14;
+    this.brightness = 0.4 + Math.random() * 0.6;
+    this.reverse = Math.random() > 0.5;
+  }
+  update(dt) {
+    if (this.cooldown > 0) { this.cooldown -= dt; if (this.cooldown <= 0) this.reset(); return; }
+    if (!this.active) { this.reset(); return; }
+    this.progress += this.speed * dt;
+    if (this.progress > 1 + this.tailLen) {
+      this.active = false;
+      this.cooldown = 0.5 + Math.random() * 4;
+    }
+  }
+  draw() {
+    if (!this.active || !circuitBg) return;
+    if (this.traceIdx >= circuitBg.traces.length) { this.active = false; return; }
+    const trace = circuitBg.traces[this.traceIdx];
+    const c = PAL[this.ci];
+
+    // Pulse head position
+    const rawHead = this.reverse ? 1 - this.progress : this.progress;
+    const rawTail = this.reverse ? 1 - this.progress + this.tailLen : this.progress - this.tailLen;
+    const headT = Math.max(0, Math.min(1, rawHead));
+    const tailT = Math.max(0, Math.min(1, rawTail));
+    const tMin = Math.min(headT, tailT), tMax = Math.max(headT, tailT);
+
+    // Draw glowing tail
+    const steps = 10;
+    for (let i = 0; i < steps; i++) {
+      const t0 = lerp(tMin, tMax, i / steps);
+      const t1 = lerp(tMin, tMax, (i + 1) / steps);
+      const p0 = getPointOnPath(trace.path, trace.length, t0);
+      const p1 = getPointOnPath(trace.path, trace.length, t1);
+      const fade = this.reverse ? (1 - i / steps) : (i / steps);
+      ctx.beginPath();
+      ctx.moveTo(p0[0], p0[1]);
+      ctx.lineTo(p1[0], p1[1]);
+      ctx.strokeStyle = rgba(c, fade * this.brightness * 0.5);
+      ctx.lineWidth = (1 + fade * 2) * S;
+      ctx.stroke();
+    }
+
+    // Bright head dot
+    if (headT > 0 && headT < 1) {
+      const pos = getPointOnPath(trace.path, trace.length, headT);
+      ctx.beginPath();
+      ctx.arc(pos[0], pos[1], 3.5 * S, 0, Math.PI * 2);
+      ctx.fillStyle = rgba(c, this.brightness * 0.7);
+      ctx.shadowColor = rgba(c, this.brightness);
+      ctx.shadowBlur = 18 * S;
+      ctx.fill();
+      // White-hot center
+      ctx.beginPath();
+      ctx.arc(pos[0], pos[1], 1.5 * S, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(255,255,255,${this.brightness * 0.6})`;
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+  }
+}
+
+// --- Vignette ---
+function drawVignette() {
+  const d = Math.max(W, H);
+  const g = ctx.createRadialGradient(W / 2, H / 2, d * 0.3, W / 2, H / 2, d * 0.85);
+  g.addColorStop(0, 'rgba(2,2,8,0)');
+  g.addColorStop(1, 'rgba(2,2,8,0.5)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+}
+
+// --- Scene objects ---
+const area = (W * H) / (1920 * 1080);
+const particles = Array.from({ length: Math.max(40, 80 * area | 0) }, () => new Particle());
+const beams = Array.from({ length: Math.max(3, 5 * area | 0) }, () => new Beam());
+const orbs = Array.from({ length: Math.max(3, 5 * area | 0) }, () => new Orb());
+const tracePulses = Array.from({ length: Math.max(8, 15 * area | 0) }, () => new TracePulse());
+
+// --- Zero-G floating motion ---
+// Multiple sine waves at irrational-ratio frequencies = smooth, never-repeating drift
+const DRIFT = {
+  xFreqs: [0.13, 0.071, 0.031],
+  yFreqs: [0.097, 0.053, 0.023],
+  xPhases: [0, 2.1, 4.7],
+  yPhases: [1.3, 3.8, 0.5],
+  rotFreq: 0.067,
+  scaleFreq: 0.041,
+};
+
+function getLogoPosition(time) {
+  const padX = 240 * S;
+  const padY = 200 * S;
+  const rangeX = (W / 2 - padX);
+  const rangeY = (H / 2 - padY);
+
+  let dx = 0, dy = 0;
+  for (let i = 0; i < 3; i++) {
+    dx += Math.sin(time * DRIFT.xFreqs[i] + DRIFT.xPhases[i]) * (1 / (i + 1));
+    dy += Math.sin(time * DRIFT.yFreqs[i] + DRIFT.yPhases[i]) * (1 / (i + 1));
+  }
+  dx /= 1.83; // normalize sum of 1 + 0.5 + 0.33
+  dy /= 1.83;
+
+  const x = W / 2 + dx * rangeX;
+  const y = H / 2 + dy * rangeY;
+  const rot = Math.sin(time * DRIFT.rotFreq) * 0.06 + Math.sin(time * 0.029) * 0.03;
+  const scale = 1 + Math.sin(time * DRIFT.scaleFreq) * 0.05;
+
+  return { x, y, rot, scale };
+}
+
+// --- Main loop ---
+let lastT = performance.now();
+
+function animate(now) {
+  const dt = Math.min((now - lastT) / 1000, 0.1);
+  lastT = now;
+  const time = now / 1000;
+
+  // Background
+  drawBg(time);
+  // Data pulses traveling along circuit traces
+  for (const tp of tracePulses) { tp.update(dt); tp.draw(); }
+  for (const o of orbs) { o.update(dt); o.draw(); }
+  for (const b of beams) { b.update(dt); b.draw(); }
+  ctx.save();
+  for (const p of particles) { p.update(dt); p.draw(); }
+  ctx.restore();
+
+  // Floating Solana S logo
+  const pos = getLogoPosition(time);
+  drawSolanaLogo(pos.x, pos.y, pos.scale, pos.rot, time);
+
+  // Vignette
+  drawVignette();
+
+  requestAnimationFrame(animate);
+}
+
+requestAnimationFrame(animate);
+</script>
+</body>
+</html>
